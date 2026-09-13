@@ -1,3 +1,5 @@
+from concurrent.futures import ThreadPoolExecutor
+
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -86,6 +88,23 @@ def test_create_task_requires_title() -> None:
 
     assert response.status_code == 400
     assert response.json() == {"error": "title is required and cannot be empty"}
+
+
+def test_concurrent_task_creation_keeps_unique_ids() -> None:
+    def create_task(index: int) -> dict:
+        response = client.post("/tasks", json={"title": f"Task {index}"})
+        assert response.status_code == 201
+        return response.json()
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        created_tasks = list(executor.map(create_task, range(10)))
+
+    created_ids = [task["id"] for task in created_tasks]
+    all_ids = [task["id"] for task in client.get("/tasks").json()]
+
+    assert len(created_ids) == len(set(created_ids))
+    assert len(all_ids) == len(set(all_ids))
+    assert len(all_ids) == 13
 
 
 def test_get_task() -> None:

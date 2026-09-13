@@ -1,4 +1,7 @@
+"""FastAPI implementation of the in-memory Task API assignment."""
+
 from json import JSONDecodeError
+from threading import Lock
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response, status
@@ -57,18 +60,24 @@ SEED_TASKS = [
 ]
 
 tasks: list[Task] = [task.model_copy() for task in SEED_TASKS]
+tasks_lock = Lock()
 
 
-def reset_tasks() -> None:
-    tasks.clear()
-    tasks.extend(task.model_copy() for task in SEED_TASKS)
+def reset_tasks() -> list[Task]:
+    """Restore the task list to the seed data and return a snapshot."""
+    with tasks_lock:
+        tasks.clear()
+        tasks.extend(task.model_copy() for task in SEED_TASKS)
+        return [task.model_copy() for task in tasks]
 
 
 def find_task(task_id: int) -> Task | None:
+    """Return a task by id, or None when it does not exist."""
     return next((task for task in tasks if task.id == task_id), None)
 
 
 def error_response(message: str, status_code: int) -> JSONResponse:
+    """Return errors in the same shape as the original Express API."""
     return JSONResponse(status_code=status_code, content={"error": message})
 
 
@@ -122,7 +131,8 @@ def list_tasks(
         default=None, description="Filter tasks whose title contains this word"
     ),
 ) -> list[Task]:
-    result = tasks
+    with tasks_lock:
+        result = [task.model_copy() for task in tasks]
 
     if done is not None:
         if done not in {"true", "false"}:
@@ -150,53 +160,48 @@ def list_tasks(
 
 @app.get("/stats")
 def get_stats() -> dict[str, int]:
-    done_count = sum(1 for task in tasks if task.done)
+    with tasks_lock:
+        done_count = sum(1 for task in tasks if task.done)
+        total = len(tasks)
 
     return {
-        "total": len(tasks),
+        "total": total,
         "done": done_count,
-        "open": len(tasks) - done_count,
+        "open": total - done_count,
     }
 
 
 @app.post("/reset", response_model=list[Task])
 def reset() -> list[Task]:
-    reset_tasks()
-    return tasks
+    return reset_tasks()
 
 
 @app.post("/tasks", response_model=Task, status_code=status.HTTP_201_CREATED)
 def create_task(payload: CreateTaskRequest) -> Task:
-    task_id = max((task.id for task in tasks), default=0) + 1
-    task = Task(id=task_id, title=payload.title, done=False)
+    with tasks_lock:
+        task_id = max((task.id for task in tasks), default=0) + 1
+        task = Task(id=task_id, title=payload.title, done=False)
 
-    tasks.append(task)
-    return task
+        tasks.append(task)
+        return task.model_copy()
 
 
 @app.get("/tasks/{task_id}", response_model=Task)
 def get_task(task_id: int) -> Task:
-    task = find_task(task_id)
+    with tasks_lock:
+        task = find_task(task_id)
 
-    if task is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"error": f"Task {task_id} not found"},
-        )
+        if task is not None:
+            return task.model_copy()
 
-    return task
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail={"error": f"Task {task_id} not found"},
+    )
 
 
 @app.put("/tasks/{task_id}", response_model=Task)
 async def update_task(task_id: int, request: Request) -> Task:
-    task = find_task(task_id)
-
-    if task is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"error": f"Task {task_id} not found"},
-        )
-
     try:
         body = await request.json()
     except JSONDecodeError:
@@ -241,9 +246,6 @@ async def update_task(task_id: int, request: Request) -> Task:
             detail={"error": "invalid request"},
         ) from exc
 
-    if has_title:
-        task.title = payload.title or task.title
-
     if has_done:
         if payload.done is None:
             raise HTTPException(
@@ -251,22 +253,37 @@ async def update_task(task_id: int, request: Request) -> Task:
                 detail={"error": "done must be a boolean"},
             )
 
-        task.done = payload.done if payload.done is not None else task.done
+    with tasks_lock:
+        task = find_task(task_id)
 
-    return task
+        if task is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"error": f"Task {task_id} not found"},
+            )
+
+        if has_title:
+            task.title = payload.title or task.title
+
+        if has_done:
+            task.done = payload.done
+
+        return task.model_copy()
 
 
 @app.delete("/tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_task(task_id: int) -> Response:
-    task = find_task(task_id)
+    with tasks_lock:
+        task = find_task(task_id)
 
-    if task is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"error": f"Task {task_id} not found"},
-        )
+        if task is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"error": f"Task {task_id} not found"},
+            )
 
-    tasks.remove(task)
+        tasks.remove(task)
+
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
